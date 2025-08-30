@@ -24,3 +24,4 @@ dist-ssr
 *.sw?
 # LLM
 src-tauri/deepseek-model
+src-tauri/resources

@@ -37,7 +37,9 @@
       "deepseek-model/tokenizer.json",
       "deepseek-model/tokenizer_config.json",
       "deepseek-model/generation_config.json",
-      "deepseek-model/LICENSE"
+      "deepseek-model/LICENSE",
+      "resources/deepseek-model/model-Q4_K_M.gguf",
+      "resources/llama-bin/llama-server"
     ]
   }
 }

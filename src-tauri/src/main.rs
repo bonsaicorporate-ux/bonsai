@@ -1,14 +1,20 @@
 #![allow(clippy::needless_return)]
 
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use tauri::Manager;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use tauri::{AppHandle, Manager};
+use tauri::Emitter;
+const HOST: &str = "127.0.0.1";
+const PORT: u16 = 8080; // llama-server port
+const MODEL_FILE: &str = "model-Q4_K_M.gguf"; // under resources/deepseek-model/
 
-const SERVER_URL: &str = "http://127.0.0.1:8080"; // llama.cpp server
+// --------------------------- App state ---------------------------
 
 #[derive(Clone, Default)]
 struct AppState {
-  server_url: Arc<Mutex<String>>,
+  server_url: Arc<std::sync::Mutex<String>>,
 }
 
 #[tauri::command]
@@ -18,13 +24,139 @@ fn echo(text: String) -> String {
 
 #[tauri::command]
 fn init_model(app: tauri::AppHandle) -> Result<String, String> {
-  // You can make this configurable if you want.
+  let url = format!("http://{}:{}", HOST, PORT);
   let state: tauri::State<'_, AppState> = app.state();
-  if let Ok(mut url) = state.server_url.lock() {
-    *url = SERVER_URL.to_string();
+  if let Ok(mut s) = state.server_url.lock() {
+    *s = url;
   }
   Ok("ready".into())
 }
+
+// --------------------- llama-server bootstrap --------------------
+
+fn resources_dir(app: &AppHandle) -> Result<PathBuf, String> {
+  app
+    .path()
+    .resolve("resources", tauri::path::BaseDirectory::Resource)
+    .map_err(|e| format!("resolve resources/: {e}"))
+}
+
+fn server_bin(app: &AppHandle) -> Result<PathBuf, String> {
+  Ok(resources_dir(app)?.join("llama-bin/llama-server"))
+}
+
+fn model_path(app: &AppHandle) -> Result<PathBuf, String> {
+  Ok(resources_dir(app)?.join(format!("deepseek-model/{MODEL_FILE}")))
+}
+
+fn server_url() -> String {
+  format!("http://{HOST}:{PORT}")
+}
+
+fn server_healthy() -> bool {
+    // simple TCP connect check instead of HTTP GET to /health
+    use std::net::TcpStream;
+    let addr = format!("{}:{}", HOST, PORT);
+    TcpStream::connect(addr).is_ok()
+  }
+
+fn wait_for_server_ready(timeout_secs: u64) -> bool {
+  let start = std::time::Instant::now();
+  while start.elapsed().as_secs() < timeout_secs {
+    if server_healthy() {
+      return true;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+  }
+  false
+}
+
+fn ensure_executable(p: &Path) -> Result<(), String> {
+  #[cfg(target_os = "macos")]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(p)
+      .map_err(|e| format!("metadata {}: {e}", p.display()))?
+      .permissions();
+    // rwx for user
+    perms.set_mode(perms.mode() | 0o700);
+    std::fs::set_permissions(p, perms)
+      .map_err(|e| format!("chmod {}: {e}", p.display()))?;
+    // best effort: strip quarantine if present (ignore errors)
+    let _ = Command::new("/usr/bin/xattr")
+      .args(["-dr", "com.apple.quarantine", p.to_string_lossy().as_ref()])
+      .output();
+  }
+  Ok(())
+}
+
+fn start_llama_if_needed(app: &AppHandle) -> Result<(), String> {
+  if server_healthy() {
+    let _ = app.emit("token", "[llama] already running");
+    return Ok(());
+  }
+
+  let bin = server_bin(app)?;
+  let model = model_path(app)?;
+
+  if !bin.exists() {
+    return Err(format!("llama-server missing at {}", bin.display()));
+  }
+  if !model.exists() {
+    return Err(format!("model missing at {}", model.display()));
+  }
+
+  ensure_executable(&bin)?;
+
+  // spawn the server
+  let mut child = Command::new(&bin)
+    .args([
+      "-m", &model.to_string_lossy(),
+      "--host", HOST,
+      "--port", &PORT.to_string(),
+      "-ngl", "999",
+      "-t", "8",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| format!("spawn llama-server: {e}"))?;
+
+  // Stream STDOUT/STDERR to UI
+  if let Some(out) = child.stdout.take() {
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+      use std::io::{BufRead, BufReader};
+      let reader = BufReader::new(out);
+      for line in reader.lines().flatten() {
+        let _ = app_clone.emit("token", format!("[llama] {line}"));
+      }
+    });
+  }
+  if let Some(err) = child.stderr.take() {
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+      use std::io::{BufRead, BufReader};
+      let reader = BufReader::new(err);
+      for line in reader.lines().flatten() {
+        let _ = app_clone.emit("token", format!("[llama!] {line}"));
+      }
+    });
+  }
+
+  // detach child (we don’t wait here)
+  std::mem::forget(child);
+
+  // wait for readiness
+  if wait_for_server_ready(20) {
+    let _ = app.emit("token", "[llama] ready on :8080");
+    Ok(())
+  } else {
+    Err("llama-server did not become healthy in time".into())
+  }
+}
+
+// --------------------------- Completion API ---------------------------
 
 #[derive(Debug, Serialize)]
 struct CompletionRequest<'a> {
@@ -44,26 +176,23 @@ struct CompletionRequest<'a> {
 
 #[derive(Debug, Deserialize)]
 struct CompletionChunk {
-  // llama.cpp /completion stream chunks typically include these:
   #[serde(default)]
   content: String,
   #[serde(default)]
   stop: bool,
-  // sometimes include timings / tokens, we ignore safely if absent
 }
 
 #[tauri::command]
 fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
-  // The DeepSeek-R1 readme recommends starting output with <think>\n (no system prompt).
-  let user_prompt = prompt.trim().to_string();
-  let final_prompt = format!("{user}\n<think>\n", user = user_prompt);
+  // DeepSeek-R1 suggestion: begin with <think>
+  let final_prompt = format!("{}\n<think>\n", prompt.trim());
 
-  // background task: async streaming via reqwest
   let app_for_thread = app.clone();
   tauri::async_runtime::spawn(async move {
     use futures_util::StreamExt;
     use tauri::Emitter;
 
+    // ensure URL in state
     let state: tauri::State<'_, AppState> = app_for_thread.state();
     let server_url = {
       match state.server_url.lock() {
@@ -78,18 +207,24 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
     let url = format!("{}/completion", server_url);
     let _ = app_for_thread.emit("token", "▶︎ start ");
 
-    // we’ll stop if model emits </think> (recommended by R1 notes)
     let req_body = CompletionRequest {
       prompt: &final_prompt,
       stop: Some(vec!["</think>"]),
-      temperature: Some(0.6),  // per R1 rec: 0.5–0.7
+      temperature: Some(0.6),
       top_p: Some(0.95),
-      n_predict: Some(256),     // adjust as you like
+      n_predict: Some(256),
       cache_prompt: Some(true),
       stream: true,
     };
 
-    let client = reqwest::Client::new();
+    let client = match reqwest::Client::builder().build() {
+      Ok(c) => c,
+      Err(e) => {
+        let _ = app_for_thread.emit("token", format!("[ERR] build client: {e}"));
+        return;
+      }
+    };
+
     let resp = match client.post(&url).json(&req_body).send().await {
       Ok(r) => r,
       Err(e) => {
@@ -101,32 +236,26 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
     if !resp.status().is_success() {
       let code = resp.status();
       let text = resp.text().await.unwrap_or_default();
-      let _ = app_for_thread.emit("token", format!("[ERR] HTTP {code}: {text}"));
+      let _ = app_for_thread.emit("token", format!("[ERR] HTTP {code} {text}"));
       return;
     }
 
-    // The stream is SSE-like: lines beginning with "data: {...}"
+    // stream SSE-like lines
     let mut stream = resp.bytes_stream();
-
-    // simple line buffer across chunks
     let mut buf = Vec::<u8>::new();
 
     while let Some(chunk) = stream.next().await {
       match chunk {
         Ok(bytes) => {
           buf.extend_from_slice(&bytes);
-
-          // split by '\n'
           while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line = buf.drain(..=pos).collect::<Vec<_>>();
             if line.starts_with(b"data: ") {
-              let payload = &line[6..line.len().saturating_sub(1)]; // strip "data: " and trailing '\n'
+              let payload = &line[6..line.len().saturating_sub(1)];
               if payload == b"[DONE]" {
-                // finished
                 let _ = app_for_thread.emit("token", "\n✓ done");
                 return;
               }
-              // try to parse JSON chunk
               if let Ok(text) = std::str::from_utf8(payload) {
                 match serde_json::from_str::<CompletionChunk>(text) {
                   Ok(ch) => {
@@ -139,8 +268,10 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
                     }
                   }
                   Err(e) => {
-                    // non-fatal: print raw for debugging
-                    let _ = app_for_thread.emit("token", format!("\n[WARN] bad chunk: {e} :: {text}"));
+                    let _ = app_for_thread.emit(
+                      "token",
+                      format!("\n[WARN] bad chunk: {e} :: {text}"),
+                    );
                   }
                 }
               }
@@ -160,9 +291,21 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
   Ok(())
 }
 
+// ------------------------------ Boot ------------------------------
+
 fn main() {
   tauri::Builder::default()
     .manage(AppState::default())
+    .setup(|app| {
+      // OWN the handle so it’s 'static inside the thread
+      let app_handle = app.handle().clone();
+      std::thread::spawn(move || {
+        if let Err(e) = start_llama_if_needed(&app_handle) {
+          let _ = app_handle.emit("token", format!("[ERR] start llama: {e}"));
+        }
+      });
+      Ok(())
+    })
     .invoke_handler(tauri::generate_handler![echo, init_model, generate])
     .run(tauri::generate_context!())
     .expect("error while running tauri app");
