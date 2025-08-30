@@ -32,4 +32,7 @@ safetensors = "0.6.2"
 tokenizers = { version = "0.22.0", features = ["http"] }
 memmap2 = "0.9.8"
 rand = "0.8"
+# HTTP + streaming
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
 
