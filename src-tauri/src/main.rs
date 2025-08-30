@@ -8,17 +8,15 @@ use tauri::{AppHandle, Manager};
 use tauri::Emitter;
 const HOST: &str = "127.0.0.1";
 const PORT: u16 = 8080; // llama-server port
-const MODEL_FILE: &str = "model-Q4_K_M.gguf"; // under resources/deepseek-model/
+// const MODEL_FILE: &str = "model-Q4_K_M.gguf"; // under resources/deepseek-model/
+const MODEL_FILE: &str = "Phi-4-mini-reasoning-Q4_K_M.gguf";
 const DEBUG_LLAMA_LOGS: bool = false; // flip to true if you want to see server logs
 // -------- System primer you can edit any time --------
 const USE_PRIMER: bool = true;
-const SYSTEM_PRIMER: &str = r#"
-You are a careful, concise assistant.
-- Do all reasoning inside <think>…</think>.
-- After </think>, output only the final answer in clear, concise prose (no preamble). Be sure that proper grammar is respected in your response.
-- If a question is ambiguous, ask a short clarifying question.
-- For math, compute carefully; if a final numeric result exists, include it.
-"#;
+const SYSTEM_PRIMER: &str = "\
+You are Phi, an expert math problem solver. Reason internally and do not reveal \
+your scratch work. Provide only the final answer, ideally as \\boxed{...}. \
+If the user explicitly asks for steps, give a brief, clean outline only.";
 // --------------------------- App state ---------------------------
 
 #[derive(Clone, Default)]
@@ -199,12 +197,12 @@ struct CompletionChunk {
 
 #[tauri::command]
 fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
-  // DeepSeek-R1 suggestion: begin with <think>
-  let final_prompt = if USE_PRIMER {
-    format!("{sys}\n\nUser: {u}\n<think>\n", sys = SYSTEM_PRIMER, u = prompt.trim())
-  } else {
-    format!("{}\n<think>\n", prompt.trim())
-  };
+    let user = prompt.trim();
+    let final_prompt = format!(
+        "<|system|>{sys}<|end|><|user|>{u}<|end|><|assistant|>",
+        sys = SYSTEM_PRIMER,
+        u = user
+    );
 
   let app_for_thread = app.clone();
   tauri::async_runtime::spawn(async move {
@@ -227,14 +225,14 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
     let _ = app_for_thread.emit("token", "▶︎ start ");
 
     let req_body = CompletionRequest {
-      prompt: &final_prompt,
-      stop: None,
-      temperature: Some(0.6),
-      top_p: Some(0.95),
-      n_predict: Some(1024),
-      cache_prompt: Some(true),
-      stream: true,
-    };
+        prompt: &final_prompt,
+        stop: Some(vec!["<|end|>"]),   // Phi chat stop
+        temperature: Some(0.7),        // math-friendly
+        top_p: Some(0.95),
+        n_predict: Some(2048),         // give it room; raise if you need longer
+        cache_prompt: Some(true),
+        stream: true,
+      };
 
     let client = match reqwest::Client::builder().build() {
       Ok(c) => c,
