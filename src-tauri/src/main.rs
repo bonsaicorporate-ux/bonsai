@@ -60,20 +60,34 @@ fn server_url() -> String {
   format!("http://{HOST}:{PORT}")
 }
 
-fn server_healthy() -> bool {
-    // simple TCP connect check instead of HTTP GET to /health
-    use std::net::TcpStream;
-    let addr = format!("{}:{}", HOST, PORT);
-    TcpStream::connect(addr).is_ok()
+fn server_http_healthy() -> bool {
+  use reqwest::blocking::Client;
+  let url = format!("http://{}:{}/health", HOST, PORT);
+  let client = match Client::builder()
+      .timeout(std::time::Duration::from_secs(2))
+      .build()
+  {
+      Ok(c) => c,
+      Err(_) => return false,
+  };
+  match client.get(&url).send() {
+      Ok(resp) => resp.status().is_success(),
+      Err(_) => false,
   }
+}
+
+// Keep the old name so existing calls compile:
+fn server_healthy() -> bool {
+  server_http_healthy()
+}
 
 fn wait_for_server_ready(timeout_secs: u64) -> bool {
   let start = std::time::Instant::now();
   while start.elapsed().as_secs() < timeout_secs {
-    if server_healthy() {
+    if server_http_healthy() {
       return true;
     }
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(250));
   }
   false
 }
@@ -195,8 +209,20 @@ struct CompletionChunk {
   stop: bool,
 }
 
+fn err_chain(mut e: &dyn std::error::Error) -> String {
+  let mut s = format!("{e}");
+  while let Some(src) = e.source() {
+      s.push_str(&format!("; caused by: {src}"));
+      e = src;
+  }
+  s
+}
+
 #[tauri::command]
 fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
+    if let Err(e) = start_llama_if_needed(&app) {
+        return Err(format!("llama not ready: {e}"));
+    }
     let user = prompt.trim();
     let final_prompt = format!(
         "<|system|>{sys}<|end|><|user|>{u}<|end|><|assistant|>",
@@ -245,7 +271,7 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
     let resp = match client.post(&url).json(&req_body).send().await {
       Ok(r) => r,
       Err(e) => {
-        let _ = app_for_thread.emit("token", format!("[ERR] POST {url}: {e}"));
+        let _ = app_for_thread.emit("token", format!("[ERR] POST {url}: {}", err_chain(&e)));
         return;
       }
     };
