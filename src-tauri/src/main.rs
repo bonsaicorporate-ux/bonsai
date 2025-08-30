@@ -9,7 +9,16 @@ use tauri::Emitter;
 const HOST: &str = "127.0.0.1";
 const PORT: u16 = 8080; // llama-server port
 const MODEL_FILE: &str = "model-Q4_K_M.gguf"; // under resources/deepseek-model/
-
+const DEBUG_LLAMA_LOGS: bool = false; // flip to true if you want to see server logs
+// -------- System primer you can edit any time --------
+const USE_PRIMER: bool = true;
+const SYSTEM_PRIMER: &str = r#"
+You are a careful, concise assistant.
+- Do all reasoning inside <think>…</think>.
+- After </think>, output only the final answer in clear, concise prose (no preamble). Be sure that proper grammar is respected in your response.
+- If a question is ambiguous, ask a short clarifying question.
+- For math, compute carefully; if a final numeric result exists, include it.
+"#;
 // --------------------------- App state ---------------------------
 
 #[derive(Clone, Default)]
@@ -129,7 +138,9 @@ fn start_llama_if_needed(app: &AppHandle) -> Result<(), String> {
       use std::io::{BufRead, BufReader};
       let reader = BufReader::new(out);
       for line in reader.lines().flatten() {
-        let _ = app_clone.emit("token", format!("[llama] {line}"));
+        if DEBUG_LLAMA_LOGS {
+            let _ = app_clone.emit("log", format!("[llama] {line}"));
+          }
       }
     });
   }
@@ -139,7 +150,9 @@ fn start_llama_if_needed(app: &AppHandle) -> Result<(), String> {
       use std::io::{BufRead, BufReader};
       let reader = BufReader::new(err);
       for line in reader.lines().flatten() {
-        let _ = app_clone.emit("token", format!("[llama!] {line}"));
+        if DEBUG_LLAMA_LOGS {
+            let _ = app_clone.emit("log", format!("[llama!] {line}"));
+          }
       }
     });
   }
@@ -149,7 +162,9 @@ fn start_llama_if_needed(app: &AppHandle) -> Result<(), String> {
 
   // wait for readiness
   if wait_for_server_ready(20) {
-    let _ = app.emit("token", "[llama] ready on :8080");
+    if DEBUG_LLAMA_LOGS {
+        let _ = app.emit("log", "[llama] ready on :8080");
+      }
     Ok(())
   } else {
     Err("llama-server did not become healthy in time".into())
@@ -185,7 +200,11 @@ struct CompletionChunk {
 #[tauri::command]
 fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
   // DeepSeek-R1 suggestion: begin with <think>
-  let final_prompt = format!("{}\n<think>\n", prompt.trim());
+  let final_prompt = if USE_PRIMER {
+    format!("{sys}\n\nUser: {u}\n<think>\n", sys = SYSTEM_PRIMER, u = prompt.trim())
+  } else {
+    format!("{}\n<think>\n", prompt.trim())
+  };
 
   let app_for_thread = app.clone();
   tauri::async_runtime::spawn(async move {
@@ -209,10 +228,10 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
 
     let req_body = CompletionRequest {
       prompt: &final_prompt,
-      stop: Some(vec!["</think>"]),
+      stop: None,
       temperature: Some(0.6),
       top_p: Some(0.95),
-      n_predict: Some(256),
+      n_predict: Some(1024),
       cache_prompt: Some(true),
       stream: true,
     };
@@ -240,6 +259,11 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
       return;
     }
 
+
+    // --- hide <think> until </think> ---
+    let mut hide_think = true;
+    let mut stash = String::new();
+
     // stream SSE-like lines
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::<u8>::new();
@@ -259,9 +283,23 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
               if let Ok(text) = std::str::from_utf8(payload) {
                 match serde_json::from_str::<CompletionChunk>(text) {
                   Ok(ch) => {
-                    if !ch.content.is_empty() {
-                      let _ = app_for_thread.emit("token", ch.content);
-                    }
+                    let piece = ch.content;
+                    if !piece.trim().is_empty() {
+                        if hide_think {
+                          stash.push_str(&piece);
+                          if let Some(idx) = stash.find("</think>") {
+                            // everything after </think> is revealed
+                            let after = stash[idx + "</think>".len()..].to_string();
+                            if !after.trim().is_empty() {
+                              let _ = app_for_thread.emit("token", after);
+                            }
+                            hide_think = false;
+                            stash.clear();
+                          }
+                        } else {
+                          let _ = app_for_thread.emit("token", piece);
+                        }
+                      }
                     if ch.stop {
                       let _ = app_for_thread.emit("token", "\n✓ done");
                       return;
