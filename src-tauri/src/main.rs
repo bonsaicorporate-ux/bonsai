@@ -31,11 +31,26 @@ fn echo(text: String) -> String {
 
 #[tauri::command]
 fn init_model(app: tauri::AppHandle) -> Result<String, String> {
-  let url = format!("http://{}:{}", HOST, PORT);
-  let state: tauri::State<'_, AppState> = app.state();
-  if let Ok(mut s) = state.server_url.lock() {
-    *s = url;
+    let url = format!("http://{}:{}", HOST, PORT);
+
+    // ✅ put the lock in its own scope so the guard drops before we do other work
+    {
+      let state = app.state::<AppState>();
+      if let Ok(mut s) = state.server_url.lock() {
+        *s = url.clone();
+      }
+    }
+  // Ensure server is running (start if needed)
+  if let Err(e) = start_llama_if_needed(&app) {
+    let _ = app.emit("token", format!("[ERR] start llama: {e}"));
+    return Err(e);
   }
+
+  // Wait until it’s actually accepting connections
+  if !wait_for_server_ready(30) {
+    return Err(format!("llama-server at {} not healthy in time", url));
+  }
+
   Ok("ready".into())
 }
 
@@ -243,12 +258,19 @@ fn generate(app: tauri::AppHandle, prompt: String) -> Result<(), String> {
     };
 
     let resp = match client.post(&url).json(&req_body).send().await {
-      Ok(r) => r,
-      Err(e) => {
-        let _ = app_for_thread.emit("token", format!("[ERR] POST {url}: {e}"));
-        return;
-      }
-    };
+        Ok(r) => r,
+        Err(e) => {
+          use std::error::Error as _;
+          let mut msg = format!("[ERR] POST {url}: {e}");
+          let mut src = e.source();
+          while let Some(s) = src {
+            msg.push_str(&format!(" :: {}", s));
+            src = s.source();
+          }
+          let _ = app_for_thread.emit("token", msg);
+          return;
+        }
+      };
 
     if !resp.status().is_success() {
       let code = resp.status();
